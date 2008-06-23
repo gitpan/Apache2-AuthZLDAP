@@ -22,11 +22,11 @@ Apache2::AuthZLDAP - Authorization module based on LDAP filters or LDAP groups
 
 =head1 VERSION
 
-Version 0.01
+Version 0.02
 
 =cut
 
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 
 =head1 SYNOPSIS
 
@@ -39,18 +39,18 @@ This module can work with all authentification module that provides a valid REMO
 =over
 
 =item *
-basic auth
+Basic Apache auth
 
 =item *
-CAS authentication (mod_cas)
+CAS authentication (mod_cas, Apache2::AuthCAS)
 
 =back 
 
 Example with CAS authentication :
 
     <VirtualHost 192.168.0.1:80>
-    ## this vars can be initialized out of directory 
-    PerlSetVar LDAPhost            myldaphost
+    ## these vars can be initialized outside of directory 
+    PerlSetVar LDAPURI             ldap://myldaphost/
     PerlSetVar LDAPbaseDN          ou=groups,dc=organization,dc=domain
 
  
@@ -58,7 +58,7 @@ Example with CAS authentication :
     AuthName CAS
     AuthType CAS
     ## define a filter. [uid] will be replaced by user value on runtime 
-    PerlSetVar LDAPfilter        &(member=uid=[uid],ou=people,dc=organization,dc=domain)(cn=admins)
+    PerlSetVar LDAPfilter          &(member=uid=[uid],ou=people,dc=organization,dc=domain)(cn=admins)
     ## charging of the module for authZ
     PerlAuthzHandler Apache2::AuthZLDAP
     require valid-user
@@ -66,29 +66,60 @@ Example with CAS authentication :
 
     </VirtualHost>
 
-Other configuration directives (optional) :
+=head2 Configuration Options
 
-=over
+    # Set to the LDAP URI
+    # Multiple URIs can be set for failover LDAP servers
+    # Note: ldaps Defaults to port 636
+    PerlSetVar LDAPURI          ldap://ldaphost1
+    PerlSetVar LDAPURI          ldaps://ldaphost2
+    PerlSetVar LDAPURI          ldap://ldaphost3:1001
 
-=item *
-PerlSetVar LDAPTLS (yes|no) ## is the session TLS ? default no
+    # How to handle the certificate verification for ldaps:// URIs
+    # See start_tls in Net::LDAP for more information
+    # If you set any of the LDAPSSL* variables, be sure to include only
+    # ldaps:// URIs. Otherwise the connection will fail.
+    # (none|optional|require)
+    PerlSetVar LDAPSSLverify    none
 
-=item *
-PerlSetVar LDAPCAfile <path> ## see start_tls cafile option in Net::LDAP 
+    # Set to a directory that contains the CA certs
+    PerlSetVar LDAPSSLcapath    /path/to/cadir
 
-=item *
-PerlSetVar TLSverify (none|optional|require) ## see start_tls verify option in Net::LDAP 
+    # Set to a file that contains the CA cert
+    PerlSetVar LDAPSSLcafile    /path/to/cafile.pem
 
-=item *
-PerlSetVar LDAPuser myuser # if user/paswword required to bind
+    # Turn on TLS to encrypt a connection
+    # Note: This is different from ldaps:// connections. ldaps:// specifies
+    # an LDAP connection totally encapsulated by SSL usually running on a 
+    # different port. TLS tells the LDAP server to encrypt a cleartext ldap://
+    # connection from the time the start_tls command is issued.
+    # (yes|no)
+    PerlSetVar LDAPTLS          yes
 
-=item *
-PerlSetVar LDAPpassword mypasswd # id.
+    # How to handle the certificate verification
+    # See start_tls in Net::LDAP for more information
+    # (none|optional|require)
+    PerlSetVar LDAPTLSverify    none
 
-=item *
-PerlSetVar LDAPscope (base|one|sub) # default sub
+    # Set to a directory that contains the CA certs
+    PerlSetVar LDAPTLScapath    /path/to/cadir
 
-=back 
+    # Set to a file that contains the CA cert
+    PerlSetVar LDAPTLScafile    /path/to/cafile.pem
+
+    # Specifies a user/password to use for the bind
+    # If LDAPuser is not specified, AuthZLDAP will attempt an anonymous bind
+    PerlSetVar LDAPuser         cn=user,o=org
+    PerlSetVar LDAPpassword     secret
+
+    # Sets the LDAP search scope
+    # (base|one|sub)
+    # Defaults to sub
+    PerlSetVar LDAPscope        sub
+
+    # Defines the search filter
+    # [uid] will be replaced by the username passed in to AuthZLDAP
+    PerlSetVar LDAPfilter       &(member=uid=[uid],ou=people,dc=organization,dc=domain)(cn=admins)
 
 =cut
 
@@ -97,103 +128,91 @@ sub handler{
     return Apache2::Const::OK unless $r->is_initial_req;
 
     ## Location Variables to connect to the good server
-    my $LDAPHost = lc($r->dir_config('LDAPhost')) || "localhost";
-    my $LDAPPort = $r->dir_config('LDAPport') || "";
+    my @LDAPURI = $r->dir_config->get('LDAPURI');
+
+    my $LDAPSSLverify = lc($r->dir_config('LDAPSSLverify'));
+    my $LDAPSSLcapath = $r->dir_config('LDAPSSLcapath');
+    my $LDAPSSLcafile = $r->dir_config('LDAPSSLcafile');
+    
     my $LDAPTLS =  lc($r->dir_config('LDAPTLS')) || "no";
-    my $CAfile =  lc($r->dir_config('TLSCAfile')) || "";
-    my $TLSverify = lc($r->dir_config('TLSverify')) || "optional";
-    my $ciphers = $r->dir_config('TLSciphers') || 'ALL:!ADH:!EXPORT56:RC4+RSA:+HIGH:+MEDIUM:+LOW:+SSLv2:+EXP';
+    my $LDAPTLSverify = lc($r->dir_config('LDAPTLSverify'));
+    my $LDAPTLScapath = $r->dir_config('LDAPTLScapath');
+    my $LDAPTLScafile = $r->dir_config('LDAPTLScafile');
+
     if($LDAPTLS ne "yes" && $LDAPTLS ne "no"){
 	$LDAPTLS="no";
     }
+
     ## bind
-    my $LDAPUser = $r->dir_config('LDAPuser')|| ""; 
-    my $LDAPPassword = $r->dir_config('LDAPpassword')|| "";
-    my $customFile = $r->dir_config('ResponseFile') || "";
+    my $LDAPuser = $r->dir_config('LDAPuser'); 
+    my $LDAPpassword = $r->dir_config('LDAPpassword');
 
     ## baseDN and Filters
-    my $LDAPbaseDN = $r->dir_config('LDAPbaseDN'); ## list for which the mail will be checked
-    my $LDAPscope =  $r->dir_config('LDAPscope') || "sub";
-    my $LDAPfilter = $r->dir_config('LDAPfilter')|| "";
+    my $LDAPbaseDN = $r->dir_config('LDAPbaseDN');
+    my $LDAPscope =  lc($r->dir_config('LDAPscope'));
+    my $LDAPfilter = $r->dir_config('LDAPfilter');
+
+    if($LDAPscope ne 'base' && $LDAPscope ne 'one' && $LDAPscope ne 'sub'){
+        $LDAPscope = 'sub';
+    }
     
-    
-   
-    my $auth_type = lc($r->auth_type) ||"";
     my $location = $r->location;
+    
+    ## Some error checking
+    if (not @LDAPURI) {
+        $r->log_error("Apache2::AuthZLDAP : $location, did not specify a LDAPURI");
+	return Apache2::Const::HTTP_UNAUTHORIZED; 
+    }
+
+    if (not defined $LDAPfilter) {
+        $r->log_error("Apache2::AuthZLDAP : $location, did not specify a LDAPfilter");
+	return Apache2::Const::HTTP_UNAUTHORIZED; 
+    }
+
     ## did user authentified ?
     ## retrieval of user id
-
-    my $user = $r->user || "";
-    if ($user eq ""){
+    my $user = $r->user;
+    if (not defined $user){
 	$r->log_error("Apache2::AuthZLDAP : $location, user didn't authentify uid empty");
 	return Apache2::Const::HTTP_UNAUTHORIZED; 
     }else{
 	$LDAPfilter =~ s/\[uid\]/$user/;
     }
 
-    
     ## port initialisation
-    if($LDAPPort eq ""){
-	if($LDAPTLS eq 'no'){
-	    $LDAPPort = 389;
-	}else{
-	    $LDAPPort = 636;
-	}
-    }
-    if($LDAPTLS eq 'no'){
-	if($LDAPHost =~ /^ldap(|s):\/\//){
-	    $LDAPHost =~ s/^([^:]*:)/ldap:/;
-	}else{
-	    $LDAPHost = "ldap://".$LDAPHost;
-	}
-    }else{
-	if($LDAPHost =~ /^ldap(|s):\/\//){
-	    $LDAPHost =~ s/^([^:]*:)/ldaps:/;
-	}else{
-	    $LDAPHost = "ldaps://".$LDAPHost;
-	}
-    }
-
-    my $session;
+    my $session; ## TODO make this come from a pool maybe?
     my $mesg;
-    my $connectionstring="$LDAPHost:$LDAPPort";
 
-    if ($LDAPTLS eq "yes"){
-	if ($CAfile ne ""){
-	    unless ($session = Net::LDAP->new($connectionstring,cafile=>$CAfile,verify=>$TLSverify,onerror=>sub{	$r->log_error("Apache2::AuthZLDAP : $location, $@ "); die;})){
-		$r->log_error("Apache2::AuthZLDAP : $location, LDAP error cannot create TLS session on verify='$TLSverify' to $LDAPHost:$LDAPPort");
-		return Apache2::Const::HTTP_UNAUTHORIZED;
-	    }
-	}else{
-	    unless ($session = Net::LDAP->new($connectionstring,onerror=>sub{	$r->log_error("Apache2::AuthZLDAP : $location, $@ "); die})){
-		$r->log_error("Apache2::AuthZLDAP : $location, LDAP error cannot create TLS session to $LDAPHost:$LDAPPort");
-		return Apache2::Const::HTTP_UNAUTHORIZED;
-	    }
-	}
-    }else{
-	unless ($session = Net::LDAP->new("$LDAPHost:$LDAPPort",onerror=>sub{	$r->log_error("Apache2::AuthZLDAP : $location, $@ "); die})){
-	    $r->log_error("Apache2::AuthZLDAP : $location, LDAP error cannot create session to $LDAPHost:$LDAPPort");
-	    return Apache2::Const::HTTP_UNAUTHORIZED;
-	}
+    unless ($session = Net::LDAP->new(\@LDAPURI, capath=>$LDAPSSLcapath, cafile=>$LDAPSSLcafile, verify=>$LDAPSSLverify)) {
+        $r->log_error("Apache2::AuthZLDAP : $location, LDAP error cannot create session");
+        return Apache2::Const::HTTP_UNAUTHORIZED;
     }
     
-    
+    if ($LDAPTLS eq 'yes') {
+        $mesg = $session->start_tls(capath=>$LDAPTLScapath, cafile=>$LDAPTLScafile, verify=>$LDAPTLSverify);
+	if ($mesg->code) {
+             $r->log_error("Apache2::AuthZLDAP : $location, LDAP error could not start TLS : ".$mesg->error);
+	}
+        return Apache2::Const::HTTP_UNAUTHORIZED;
+    }
     
     ## user password bind if configured else anonymous
-    if($LDAPUser ne "" && $LDAPPassword ne ""){
-	$mesg = $session->bind($LDAPUser,password=>$LDAPPassword);
-	if($mesg->code){
-	    $r->log_error("Apache2::AuthZLDAP : $location, LDAP error cannot bind to $LDAPHost:$LDAPPort : ".$mesg->error);
-	    return Apache2::Const::HTTP_UNAUTHORIZED; 
-	}
+    if (defined $LDAPuser and defined $LDAPpassword){
+        $mesg = $session->bind($LDAPuser,password=>$LDAPpassword);
     }else{
-	my $mesg = $session->bind;
-	if($mesg->code){
-	    $r->log_error("Apache2::AuthZLDAP : $location, LDAP error cannot bind to $LDAPHost:$LDAPPort : ".$mesg->error);
-	    return Apache2::Const::HTTP_UNAUTHORIZED; 
-	}
+        $mesg = $session->bind();
     }
 
+    if($mesg->code){
+	my $err_msg = 'LDAP error cannot bind ';
+        if (defined $LDAPuser){
+             $err_msg .= "as $LDAPuser";
+        }else{
+             $err_msg .= 'anonymously';
+        }
+        $r->log_error("Apache2::AuthZLDAP : $location, $err_msg : ".$mesg->error);
+        return Apache2::Const::HTTP_UNAUTHORIZED; 
+    }
     
     ## search performing, if there is a result, OK
     $mesg = $session->search( # perform a search
@@ -201,7 +220,11 @@ sub handler{
 			   scope => $LDAPscope,
 			   filter => $LDAPfilter,
 			   );
-        if ($mesg->count != 0){
+    if ($mesg->code) {
+         $r->log_error("Apache2::AuthZLDAP : $location, LDAP error could not search : ".$mesg->error);
+	return Apache2::Const::HTTP_UNAUTHORIZED;
+    }
+    if ($mesg->count != 0){
 	$r->log->notice("Apache2::AuthZLDAP : $user authorized to access $location");  
 	$session->unbind;
 	return Apache2::Const::OK;
@@ -210,15 +233,12 @@ sub handler{
 	$r->log_error("Apache2::AuthZLDAP : $user not allowed to access $location");
 	return Apache2::Const::HTTP_UNAUTHORIZED;
     }
-    
-    
-    
-
 }
 
 =head1 AUTHOR
 
 Dominique Launay, C<< <dominique.launay AT cru.fr> >>
+Thanks to David Lowry, C<< <dlowry AT bju.edu> >>  for making the code more readable and improving it.
 
 =head1 BUGS
 
